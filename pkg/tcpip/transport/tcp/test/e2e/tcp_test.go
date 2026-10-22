@@ -8258,6 +8258,142 @@ func TestTCPTimeWaitRSTIgnored(t *testing.T) {
 		checker.TCPFlags(header.TCPFlagAck)))
 }
 
+// TestTCPTimeWaitNoKeepalive checks that an endpoint with keepalive enabled
+// stops sending keepalives once it enters TIME_WAIT. Linux never does this (its
+// TIME_WAIT minisock has no keepalive timer), and peers and middleboxes that
+// have already forgotten the connection see the probe as a new flow.
+func TestTCPTimeWaitNoKeepalive(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// finish sends our FIN.
+		finish func(t *testing.T, ep tcpip.Endpoint)
+		// inTimeWait runs once the endpoint is in TIME_WAIT.
+		inTimeWait func(t *testing.T, ep tcpip.Endpoint)
+	}{
+		{
+			name:       "Close",
+			finish:     func(_ *testing.T, ep tcpip.Endpoint) { ep.Close() },
+			inTimeWait: func(*testing.T, tcpip.Endpoint) {},
+		},
+		{
+			// The app still holds the fd, so it can set keepalive options
+			// after the endpoint has reached TIME_WAIT.
+			name: "ShutdownThenSetKeepalive",
+			finish: func(t *testing.T, ep tcpip.Endpoint) {
+				if err := ep.Shutdown(tcpip.ShutdownWrite); err != nil {
+					t.Fatalf("Shutdown failed: %s", err)
+				}
+			},
+			inTimeWait: func(t *testing.T, ep tcpip.Endpoint) {
+				opt := tcpip.KeepaliveIdleOption(200 * time.Millisecond)
+				if err := ep.SetSockOpt(&opt); err != nil {
+					t.Fatalf("ep.SetSockOpt(&%T(%s)): %s", opt, time.Duration(opt), err)
+				}
+				ep.SocketOptions().SetKeepAlive(true)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testTCPTimeWaitNoKeepalive(t, tc.finish, tc.inTimeWait)
+		})
+	}
+}
+
+func testTCPTimeWaitNoKeepalive(t *testing.T, finish func(*testing.T, tcpip.Endpoint), inTimeWait func(*testing.T, tcpip.Endpoint)) {
+	c := context.New(t, e2e.DefaultMTU)
+	defer c.Cleanup()
+
+	wq := &waiter.Queue{}
+	ep, err := c.Stack().NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, wq)
+	if err != nil {
+		t.Fatalf("NewEndpoint failed: %s", err)
+	}
+	if err := ep.Bind(tcpip.FullAddress{Port: context.StackPort}); err != nil {
+		t.Fatalf("Bind failed: %s", err)
+	}
+	if err := ep.Listen(10); err != nil {
+		t.Fatalf("Listen failed: %s", err)
+	}
+
+	iss := seqnum.Value(context.TestInitialSequenceNumber)
+	c.SendPacket(nil, &context.Headers{
+		SrcPort: context.TestPort,
+		DstPort: context.StackPort,
+		Flags:   header.TCPFlagSyn,
+		SeqNum:  iss,
+		RcvWnd:  30000,
+	})
+	b := c.GetPacket()
+	defer b.Release()
+	tcpHdr := header.TCP(header.IPv4(b.AsSlice()).Payload())
+	c.IRS = seqnum.Value(tcpHdr.SequenceNumber())
+	c.SendPacket(nil, &context.Headers{
+		SrcPort: context.TestPort,
+		DstPort: context.StackPort,
+		Flags:   header.TCPFlagAck,
+		SeqNum:  iss + 1,
+		AckNum:  c.IRS + 1,
+	})
+
+	we, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
+	wq.EventRegister(&we)
+	defer wq.EventUnregister(&we)
+	c.EP, _, err = ep.Accept(nil)
+	if cmp.Equal(&tcpip.ErrWouldBlock{}, err) {
+		select {
+		case <-ch:
+			c.EP, _, err = ep.Accept(nil)
+			if err != nil {
+				t.Fatalf("Accept failed: %s", err)
+			}
+		case <-time.After(1 * time.Second):
+			t.Fatalf("Timed out waiting for accept")
+		}
+	}
+
+	// What a Go server does for every accepted connection.
+	const keepAliveIdle = 200 * time.Millisecond
+	keepAliveIdleOpt := tcpip.KeepaliveIdleOption(keepAliveIdle)
+	if err := c.EP.SetSockOpt(&keepAliveIdleOpt); err != nil {
+		t.Fatalf("c.EP.SetSockOpt(&%T(%s)): %s", keepAliveIdleOpt, keepAliveIdle, err)
+	}
+	keepAliveIntervalOpt := tcpip.KeepaliveIntervalOption(keepAliveIdle)
+	if err := c.EP.SetSockOpt(&keepAliveIntervalOpt); err != nil {
+		t.Fatalf("c.EP.SetSockOpt(&%T(%s)): %s", keepAliveIntervalOpt, keepAliveIdle, err)
+	}
+	c.EP.SocketOptions().SetKeepAlive(true)
+
+	// Active close, then the peer's FIN-ACK moves the endpoint to TIME_WAIT.
+	finish(t, c.EP)
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.SrcPort(context.StackPort),
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(uint32(c.IRS+1)),
+		checker.TCPAckNum(uint32(iss)+1),
+		checker.TCPFlags(header.TCPFlagFin|header.TCPFlagAck)))
+
+	c.SendPacket(nil, &context.Headers{
+		SrcPort: context.TestPort,
+		DstPort: context.StackPort,
+		Flags:   header.TCPFlagAck | header.TCPFlagFin,
+		SeqNum:  iss + 1,
+		AckNum:  c.IRS + 2,
+	})
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.SrcPort(context.StackPort),
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(uint32(c.IRS+2)),
+		checker.TCPAckNum(uint32(iss)+2),
+		checker.TCPFlags(header.TCPFlagAck)))
+
+	inTimeWait(t, c.EP)
+	c.CheckNoPacketTimeout("keepalive sent in TIME_WAIT", 5*keepAliveIdle)
+}
+
 func TestTCPTimeWaitOutOfOrder(t *testing.T) {
 	c := context.New(t, e2e.DefaultMTU)
 	defer c.Cleanup()

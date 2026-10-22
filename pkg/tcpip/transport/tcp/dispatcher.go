@@ -239,6 +239,10 @@ func startTimeWait(ep *Endpoint) {
 	if ep.finWait2Timer != nil {
 		ep.finWait2Timer.Stop()
 	}
+	// A keepalive armed while established would otherwise fire from TIME-WAIT,
+	// which Linux never does. Middleboxes that have already expired the
+	// connection treat such a probe as a new flow.
+	ep.disableKeepaliveTimer()
 	// Wake up any waiters before we start TIME-WAIT.
 	ep.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.ReadableEvents | waiter.WritableEvents)
 	timeWaitDuration := ep.getTimeWaitDuration()

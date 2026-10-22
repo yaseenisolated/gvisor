@@ -1451,8 +1451,9 @@ func (e *Endpoint) resetKeepaliveTimer(receivedData bool) {
 		e.keepalive.unacked = 0
 	}
 	// Start the keepalive timer IFF it's enabled and there is no pending
-	// data to send.
-	if !e.SocketOptions().GetKeepAlive() || e.snd == nil || e.snd.SndUna != e.snd.SndNxt {
+	// data to send. Never in TIME-WAIT: an fd held after shutdown can still
+	// set keepalive options there.
+	if !e.SocketOptions().GetKeepAlive() || e.snd == nil || e.snd.SndUna != e.snd.SndNxt || e.EndpointState() == StateTimeWait {
 		e.keepalive.timer.disable()
 		return
 	}
